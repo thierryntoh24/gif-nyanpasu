@@ -5,9 +5,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <meta name="description"
-        content="GIF Nyanpasu! Image Crop — free, browser-based image cropper. Upload one or many images, set a crop, download. Runs 100% offline. No uploads, no accounts.">
+        content="Crop Nyanpasu! — free, browser-based image and video cropper. Upload, crop, download. Runs 100% offline. No uploads, no accounts.">
     <meta name="keywords"
-        content="image crop, image cropper, batch crop, browser crop, offline image tool, png crop, jpeg crop, webp crop">
+        content="image crop, video crop, batch crop, browser crop, offline crop tool, png crop, jpeg crop, webp crop, mp4 crop, webm crop">
     <meta name="author" content="Thièrry Ntoh">
     <meta name="robots" content="index, follow">
     <link rel="canonical" href="https://gif-nyanpasu.vercel.app/crop.html">
@@ -15,10 +15,10 @@
     <!-- ── Open Graph ─────────────────────────────────────────────────── -->
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://gif-nyanpasu.vercel.app/crop.html">
-    <meta property="og:title" content="Crop Nyanpasu! — Free Browser Image Cropper">
+    <meta property="og:title" content="Crop Nyanpasu! — Free Browser Image & Video Cropper">
     <meta property="og:description"
-        content="Upload, crop, download. Supports batch cropping multiple images with the same region. Runs 100% in your browser.">
-    <meta property="og:image" content="https://gif-nyanpasu.vercel.app/public/crop-og-image.png">
+        content="Upload images or videos, crop, download. Supports batch cropping with the same region. Runs 100% in your browser.">
+    <meta property="og:image" content="https://gif-nyanpasu.vercel.app/public/og-image.png">
     <meta property="og:site_name" content="GIF Nyanpasu!">
 
     <!-- ── Favicon set ───────────────────────────────────────────────── -->
@@ -39,7 +39,7 @@
     <!-- <link rel="stylesheet" href="shared.css"> -->
     <link rel="stylesheet" href="crop.css">
 
-    <title>Crop Nyanpasu! — Free Browser Image Cropper</title>
+    <title>Crop Nyanpasu! — Free Browser Image & Video Cropper</title>
 </head>
 
 <body>
@@ -61,8 +61,8 @@
             </svg>
         </div>
         <div class="header-text">
-            <h1>Crop Nyanpasu</h1>
-            <p class="tagline">Upload · Crop · Download &nbsp;·&nbsp; 100% offline</p>
+            <h1>Crop Nyanpasu!</h1>
+            <p class="tagline">Images &amp; Videos · Upload · Crop · Download · 100% offline</p>
         </div>
     </header>
 
@@ -73,11 +73,10 @@
         <div class="left-col">
 
             <!-- Upload panel -->
-            <section class="panel" aria-label="Upload images">
+            <section class="panel" aria-label="Upload files">
                 <div class="panel-header">
-                    <span class="panel-title">Images</span>
-                    <button class="btn-clear-all" id="clearAllBtn" disabled
-                        aria-label="Clear all images from workspace">
+                    <span class="panel-title">Files</span>
+                    <button class="btn-clear-all" id="clearAllBtn" disabled aria-label="Clear all files from workspace">
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <polyline points="3 6 5 6 21 6"></polyline>
@@ -89,19 +88,21 @@
                     </button>
                 </div>
 
-                <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp,image/gif,image/avif"
+                <input type="file" id="fileInput"
+                    accept="image/png,image/jpeg,image/webp,image/gif,image/avif,video/mp4,video/webm,video/quicktime"
                     multiple>
 
                 <div class="drop-zone" id="dropZone" role="button" tabindex="0"
-                    aria-label="Drop images here or click to browse">
+                    aria-label="Drop files here or click to browse">
                     <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
                         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <rect x="3" y="3" width="18" height="18" rx="2"></rect>
                         <circle cx="8.5" cy="8.5" r="1.5"></circle>
                         <polyline points="21 15 16 10 5 21"></polyline>
                     </svg>
-                    <p class="drop-zone-label"><strong>Drop images here</strong> or click to browse</p>
-                    <p class="drop-zone-sub">PNG · JPEG · WebP · GIF · AVIF &nbsp;·&nbsp; Multiple files supported</p>
+                    <p class="drop-zone-label"><strong>Drop files here</strong> or click to browse</p>
+                    <p class="drop-zone-sub">PNG · JPEG · WebP · GIF · AVIF · MP4 · WebM &nbsp;·&nbsp; Multiple files
+                        supported</p>
                 </div>
 
                 <div class="image-queue" id="imageQueue"></div>
@@ -128,9 +129,9 @@
                     </div>
                 </div>
 
-                <!-- Output format -->
-                <div class="setting-group">
-                    <label class="setting-label" for="formatSelect">Output Format</label>
+                <!-- Output format for images -->
+                <div class="setting-group" id="imageFormatGroup">
+                    <label class="setting-label" for="formatSelect">Image Format</label>
                     <select id="formatSelect" aria-label="Output image format">
                         <option value="image/png">PNG — lossless</option>
                         <option value="image/jpeg" selected>JPEG — smaller</option>
@@ -138,7 +139,19 @@
                     </select>
                 </div>
 
-                <!-- Quality (hidden for PNG) -->
+                <!-- Output format for videos -->
+                <div class="setting-group" id="videoFormatGroup" hidden>
+                    <label class="setting-label" for="videoFormatSelect">Video Format</label>
+                    <select id="videoFormatSelect" aria-label="Output video format">
+                        <option value="webm" selected>WebM — universal</option>
+                        <option value="mp4">MP4 — if supported</option>
+                    </select>
+                    <span id="videoFormatNote"
+                        style="font-family:var(--font-mono);font-size:0.6rem;color:var(--text2);display:block;margin-top:4px;grid-column:1/-1">
+                    </span>
+                </div>
+
+                <!-- Quality (hidden for PNG and for video) -->
                 <div class="setting-group" id="qualityGroup">
                     <label class="setting-label" for="qualityInput">Quality</label>
                     <input type="range" id="qualityInput" min="10" max="100" value="92"
@@ -175,7 +188,7 @@
                 <!-- Action buttons -->
                 <div class="action-row">
                     <button class="btn-ghost" id="resetCropBtn" style="flex:1" disabled
-                        aria-label="Reset crop to full image">
+                        aria-label="Reset crop to full frame">
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <polyline points="1 4 1 10 7 10"></polyline>
@@ -183,11 +196,11 @@
                         </svg>
                         Reset
                     </button>
-                    <button class="btn-crop" id="cropBtn" disabled aria-label="Crop active image">
-                        ✂&nbsp; Crop Image
+                    <button class="btn-crop" id="cropBtn" disabled aria-label="Crop active file">
+                        ✂&nbsp; Crop
                     </button>
                     <button class="btn-crop-all" id="cropAllBtn" disabled
-                        aria-label="Apply current crop region to all images">
+                        aria-label="Apply current crop region to all files">
                         ✂&nbsp; Crop All
                     </button>
                 </div>
@@ -198,10 +211,15 @@
         <!-- ─── RIGHT COLUMN ─────────────────────────────────────────── -->
         <div class="right-col">
 
-            <!-- Canvas preview panel -->
-            <section class="panel" aria-label="Image preview and crop area">
+            <!-- Preview panel -->
+            <section class="panel" aria-label="File preview and crop area">
                 <div class="panel-header">
                     <span class="panel-title">Preview</span>
+                    <!-- video processing indicator -->
+                    <span id="processingBadge" hidden style="font-family:var(--font-mono);font-size:0.65rem;color:var(--orange);
+                               letter-spacing:0.06em;text-transform:uppercase;animation:pulse-badge 1.2s infinite">
+                        ⏳ Processing…
+                    </span>
                 </div>
                 <div class="canvas-wrapper" id="canvasWrapper">
                     <div class="empty-state" id="emptyPreview">
@@ -211,26 +229,28 @@
                             <circle cx="8.5" cy="8.5" r="1.5"></circle>
                             <polyline points="21 15 16 10 5 21"></polyline>
                         </svg>
-                        <p>Select an image to begin cropping</p>
+                        <p>Select an image or video to begin cropping</p>
                     </div>
+                    <!-- sourceCanvas for images; sourceVideo for video — both injected/managed by crop.js -->
                     <canvas id="sourceCanvas" hidden aria-label="Image preview canvas"></canvas>
+                    <video id="sourceVideo" hidden muted loop playsinline aria-label="Video preview"></video>
                     <!-- Crop overlay injected by crop.js -->
                 </div>
             </section>
 
             <!-- Output panel -->
-            <section class="panel" aria-label="Cropped image outputs">
+            <section class="panel" aria-label="Cropped file outputs">
                 <div class="panel-header">
                     <span class="panel-title">Output</span>
                     <button class="btn-download-all" id="downloadAllBtn" disabled
-                        aria-label="Download all cropped images">
+                        aria-label="Download all cropped files as a zip archive">
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                             <polyline points="7 10 12 15 17 10"></polyline>
                             <line x1="12" y1="15" x2="12" y2="3"></line>
                         </svg>
-                        Download All
+                        Download All (.zip)
                     </button>
                 </div>
                 <div id="outputGrid" class="output-grid">
@@ -241,7 +261,7 @@
                             <polyline points="7 10 12 15 17 10"></polyline>
                             <line x1="12" y1="15" x2="12" y2="3"></line>
                         </svg>
-                        <p>Cropped images will appear here</p>
+                        <p>Cropped files will appear here</p>
                     </div>
                 </div>
             </section>
@@ -250,9 +270,12 @@
     </main>
 
     <!-- ══ Fullscreen preview overlay ══════════════════════════════════ -->
-    <div class="preview-overlay" id="previewOverlay" role="dialog" aria-modal="true"
-        aria-label="Fullscreen image preview" hidden>
-        <img id="overlayImg" alt="Fullscreen preview — click anywhere to close">
+    <div class="preview-overlay" id="previewOverlay" role="dialog" aria-modal="true" aria-label="Fullscreen preview"
+        hidden>
+        <img id="overlayImg" alt="Fullscreen preview — click anywhere to close" style="display:none">
+        <video id="overlayVid" controls loop muted playsinline style="display:none;max-width:95vw;max-height:95vh;border-radius:var(--radius);
+                   box-shadow:0 20px 60px rgba(0,0,0,0.7)">
+        </video>
     </div>
 
     <footer>
@@ -262,8 +285,33 @@
             &nbsp;·&nbsp; <a href="index.html">← Back to GIF converter</a></p>
     </footer>
 
+    <!-- ══ Crop progress overlay ══════════════════════════════════════ -->
+    <div class="crop-progress-overlay" id="cropProgressOverlay" hidden style="position:fixed;inset:0;background:rgba(22,16,31,0.9);backdrop-filter:blur(10px);
+               -webkit-backdrop-filter:blur(10px);display:flex;justify-content:center;
+               align-items:center;z-index:1000;">
+        <div style="background:var(--surface);border:1px solid var(--border2);
+                    border-top:3px solid var(--accent);border-radius:var(--radius-lg);
+                    padding:36px 48px;text-align:center;min-width:290px;max-width:92vw;
+                    box-shadow:var(--shadow)">
+            <div style="font-family:var(--font-mono);font-size:0.68rem;letter-spacing:0.12em;
+                        text-transform:uppercase;color:var(--accent2);margin-bottom:18px">
+                Processing Video
+            </div>
+            <div class="spinner" style="width:44px;height:44px;border:3px solid rgba(167,139,250,0.18);
+                 border-top-color:var(--accent);border-radius:50%;margin:0 auto 16px;
+                 animation:spin 0.85s linear infinite"></div>
+            <p id="cropProgressStatus" style="font-size:0.95rem;font-weight:700;color:var(--text);margin-bottom:4px">
+                Recording…
+            </p>
+            <p id="cropProgressDetail"
+                style="font-family:var(--font-mono);font-size:0.72rem;color:var(--text2);margin-top:8px">
+            </p>
+        </div>
+    </div>
+
     <!-- ══ Scripts: shared helpers first, then page logic ═════════════ -->
     <script src="shared.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="crop.js"></script>
 
 </body>

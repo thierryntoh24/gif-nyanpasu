@@ -1,32 +1,63 @@
 /**
- * Crop Nyanpasu! — crop.js
+ * GIF Nyanpasu! — crop.js
  *
  * Architecture:
- *   ImageEntry    — data model for one loaded image file
- *   ImageCropper  — main application class: queue, canvas, drag overlay,
- *                   aspect ratio constraints, batch crop, output grid
+ *   ImageEntry    — data model for one image file
+ *   VideoEntry    — data model for one video file
+ *   MediaCropper  — main application class
  *
- * Depends on shared.js being loaded first (clamp, fmtBytes, saveSetting
- * are globals from that file).
+ * Depends on shared.js (clamp, saveSetting) and JSZip (loaded via CDN).
+ *
+ * Key design decisions:
+ *   - The crop overlay is sized and positioned to sit exactly over the
+ *     preview element (canvas or video) using getBoundingClientRect(),
+ *     not the full wrapper. Critical for centered/portrait media.
+ *   - Video preview uses a <video> element directly; no canvas needed
+ *     until the actual crop runs.
+ *   - Video cropping uses MediaRecorder + captureStream() on an
+ *     off-screen canvas that draws cropped frames in real time.
+ *   - previewUrl is stored per-entry and never revoked by the overlay
+ *     close handler, preventing broken card thumbnails on re-open.
+ *   - "Download All" zips everything via JSZip into one file.
+ */
 
 'use strict';
 
 /* ═══════════════════════════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Compute the fitted display size for a media element inside a wrapper,
+ * respecting both the wrapper width and a max-height cap.
+ * @param {number} naturalW
+ * @param {number} naturalH
+ * @param {number} wrapW   - wrapper client width in px
+ * @param {number} maxH    - max display height in px
+ * @returns {{ w: number, h: number }}
+ */
+function fitSize(naturalW, naturalH, wrapW, maxH) {
+    const byWidth = { w: wrapW, h: Math.round(naturalH * (wrapW / naturalW)) };
+    const byHeight = { h: maxH, w: Math.round(naturalW * (maxH / naturalH)) };
+    return byWidth.h <= maxH ? byWidth : byHeight;
+}
+
+/** Map a MIME type to a file extension. */
+function mimeToExt(mime) {
+    return { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[mime] ?? 'png';
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
    IMAGE ENTRY
-   Data model for one file in the queue.
    ═══════════════════════════════════════════════════════════════════ */
 class ImageEntry {
-    /**
-     * @param {File}   file
-     * @param {string} objectUrl  - URL.createObjectURL result for the source file
-     * @param {number} naturalW   - original pixel width
-     * @param {number} naturalH   - original pixel height
-     */
     constructor(file, objectUrl, naturalW, naturalH) {
         this.file = file;
         this.objectUrl = objectUrl;
         this.naturalW = naturalW;
         this.naturalH = naturalH;
+        this.isVideo = false;
         /** Normalised crop region (0-1 ratios). Persists across selection changes. */
         this.region = { x: 0, y: 0, w: 1, h: 1 };
         /** Cropped result Blob, set after _cropEntry() runs. */
@@ -36,6 +67,7 @@ class ImageEntry {
          * Stored here so the overlay can reuse it without revoking it.
          */
         this.previewUrl = null;
+        this.thumbUrl = null;
         /** Stable id used to key output card DOM nodes. */
         this.id = crypto.randomUUID();
     }
@@ -56,9 +88,38 @@ class ImageEntry {
 
 
 /* ═══════════════════════════════════════════════════════════════════
-   IMAGE CROPPER
+   VIDEO ENTRY
    ═══════════════════════════════════════════════════════════════════ */
-class ImageCropper {
+class VideoEntry {
+    constructor(file, objectUrl, naturalW, naturalH, duration) {
+        this.file = file;
+        this.objectUrl = objectUrl;
+        this.naturalW = naturalW;
+        this.naturalH = naturalH;
+        this.duration = duration;
+        this.isVideo = true;
+        this.region = { x: 0, y: 0, w: 1, h: 1 };
+        this.cropped = null;
+        this.previewUrl = null;
+        this.thumbUrl = null;
+        this.id = crypto.randomUUID();
+    }
+
+    get pixelRegion() {
+        return {
+            x: Math.round(this.region.x * this.naturalW),
+            y: Math.round(this.region.y * this.naturalH),
+            w: Math.max(2, Math.round(this.region.w * this.naturalW)),
+            h: Math.max(2, Math.round(this.region.h * this.naturalH)),
+        };
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+   MEDIA CROPPER
+   ═══════════════════════════════════════════════════════════════════ */
+class MediaCropper {
     constructor() {
         /** @type {ImageEntry[]} */
         this.entries = [];
@@ -72,13 +133,15 @@ class ImageCropper {
         this._startX = 0;
         this._startY = 0;
         this._startRegion = null;
+        this._resizeObs = null;
 
         this._bindElements();
         this._buildCropOverlay();
         this._bindEvents();
+        this._updateVideoFormatNote();
     }
 
-    /* ── DOM references ── */
+    /* ── DOM references ────────────────────────────────────────────── */
     _bindElements() {
         const $ = id => document.getElementById(id);
         this.el = {
@@ -88,7 +151,9 @@ class ImageCropper {
             canvasWrapper: $('canvasWrapper'),
             emptyPreview: $('emptyPreview'),
             sourceCanvas: $('sourceCanvas'),
+            sourceVideo: $('sourceVideo'),
             aspectPresets: $('aspectPresets'),
+            imageFormatGroup: $('imageFormatGroup'),
             formatSelect: $('formatSelect'),
             qualityInput: $('qualityInput'),
             qualityLabel: $('qualityLabel'),
@@ -98,16 +163,24 @@ class ImageCropper {
             resetCropBtn: $('resetCropBtn'),
             cropBtn: $('cropBtn'),
             cropAllBtn: $('cropAllBtn'),
+            clearAllBtn: $('clearAllBtn'),
             outputGrid: $('outputGrid'),
             emptyOutput: $('emptyOutput'),
             downloadAllBtn: $('downloadAllBtn'),
             previewOverlay: $('previewOverlay'),
             overlayImg: $('overlayImg'),
-            clearAllBtn: $('clearAllBtn'),
+            processingBadge: $('processingBadge'),
+            videoFormatGroup: $('videoFormatGroup'),
+            videoFormatSelect: $('videoFormatSelect'),
+            videoFormatNote: $('videoFormatNote'),
+            cropProgressOverlay: $('cropProgressOverlay'),
+            cropProgressStatus: $('cropProgressStatus'),
+            cropProgressDetail: $('cropProgressDetail'),
+            overlayVid: $('overlayVid'),
         };
     }
 
-    /* ── Build drag-resize crop overlay ── */
+    /* ── Build drag-resize crop overlay ────────────────────────────── */
     _buildCropOverlay() {
         this._overlayEl = document.createElement('div');
         this._overlayEl.className = 'crop-overlay';
@@ -127,7 +200,8 @@ class ImageCropper {
         // Move drag (clicking directly on the region body)
         this._regionEl.addEventListener('mousedown', e => {
             if (e.target === this._regionEl) {
-                this._dragStart(e.clientX, e.clientY, 'move'); e.preventDefault();
+                this._dragStart(e.clientX, e.clientY, 'move');
+                e.preventDefault();
             }
         });
         this._regionEl.addEventListener('touchstart', e => {
@@ -137,7 +211,6 @@ class ImageCropper {
             }
         }, { passive: false });
 
-        // Handle drags
         this._regionEl.querySelectorAll('.crop-handle').forEach(h => {
             const kind = h.className.split(' ')[1];
             h.addEventListener('mousedown', e => {
@@ -153,21 +226,24 @@ class ImageCropper {
         document.addEventListener('mousemove', e => this._dragMove(e.clientX, e.clientY));
         document.addEventListener('mouseup', () => this._dragEnd());
         document.addEventListener('touchmove', e => {
-            if (this._dragging) { this._dragMove(e.touches[0].clientX, e.touches[0].clientY); e.preventDefault(); }
+            if (this._dragging) {
+                this._dragMove(e.touches[0].clientX, e.touches[0].clientY);
+                e.preventDefault();
+            }
         }, { passive: false });
         document.addEventListener('touchend', () => this._dragEnd());
     }
 
-    /* ── Event wiring ── */
+    /* ── Event wiring ──────────────────────────────────────────────── */
     _bindEvents() {
-        // File input + drop zone
         this.el.fileInput.addEventListener('change', e => this._addFiles(e.target.files));
         this.el.dropZone.addEventListener('click', () => this.el.fileInput.click());
         this.el.dropZone.addEventListener('keydown', e => {
             if (e.key === 'Enter' || e.key === ' ') this.el.fileInput.click();
         });
         this.el.dropZone.addEventListener('dragover', e => {
-            e.preventDefault(); this.el.dropZone.classList.add('drag-over');
+            e.preventDefault();
+            this.el.dropZone.classList.add('drag-over');
         });
         this.el.dropZone.addEventListener('dragleave', () => {
             this.el.dropZone.classList.remove('drag-over');
@@ -178,22 +254,18 @@ class ImageCropper {
             this._addFiles(e.dataTransfer.files);
         });
 
-        // Aspect ratio presets
         this.el.aspectPresets.querySelectorAll('.preset-btn').forEach(btn => {
             btn.addEventListener('click', () => {
                 this.el.aspectPresets.querySelectorAll('.preset-btn')
                     .forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
-
                 const r = btn.dataset.ratio;
-                if (r === 'free') {
-                    this.aspectRatio = null;
-                } else {
-                    const [w, h] = r.split(':').map(Number);
-                    this.aspectRatio = w / h;
-                }
-
+                this.aspectRatio = r === 'free' ? null : (() => {
+                    const [w, h] = r.split(':').map(Number); return w / h;
+                })();
                 if (this.activeIndex >= 0) {
+                    // Always reset to full frame first so ratios don't compound
+                    this.entries[this.activeIndex].region = { x: 0, y: 0, w: 1, h: 1 };
                     this._applyAspectConstraint();
                     this._renderCropRegion();
                     this._syncInputsFromRegion();
@@ -202,68 +274,109 @@ class ImageCropper {
             });
         });
 
-        // Format / quality
         this.el.formatSelect.addEventListener('change', () => {
-            const isPng = this.el.formatSelect.value === 'image/png';
-            this.el.qualityGroup.style.display = isPng ? 'none' : '';
+            this.el.qualityGroup.style.display =
+                this.el.formatSelect.value === 'image/png' ? 'none' : '';
+        });
+        this.el.videoFormatSelect.addEventListener('change', () => {
+            this._updateVideoFormatNote();
         });
         this.el.qualityInput.addEventListener('input', () => {
             this.el.qualityLabel.textContent = `${this.el.qualityInput.value}%`;
         });
 
-        // Manual pixel inputs — live sync
         [this.el.inX, this.el.inY, this.el.inW, this.el.inH].forEach(inp => {
             inp.addEventListener('input', () => this._applyManualInputs());
         });
 
-        // Buttons
         this.el.resetCropBtn.addEventListener('click', () => this._resetCrop());
         this.el.cropBtn.addEventListener('click', () => this._cropActive());
         this.el.cropAllBtn.addEventListener('click', () => this._cropAll());
-        this.el.downloadAllBtn.addEventListener('click', () => this._downloadAll());
         this.el.clearAllBtn.addEventListener('click', () => this._clearAll());
+        this.el.downloadAllBtn.addEventListener('click', () => this._downloadAll());
 
-        // Fullscreen overlay — close only; never revoke the card's previewUrl
         this.el.previewOverlay.addEventListener('click', () => {
             this.el.previewOverlay.hidden = true;
             document.body.style.overflow = '';
-            // Clear src without revoking — the URL belongs to the output card
+            this.el.overlayVid.pause();
+            this.el.overlayVid.src = '';
+            this.el.overlayVid.style.display = 'none';
             this.el.overlayImg.src = '';
+            this.el.overlayImg.style.display = 'none';
         });
+
         document.addEventListener('keydown', e => {
             if (e.key === 'Escape' && !this.el.previewOverlay.hidden)
                 this.el.previewOverlay.click();
         });
     }
 
-    /* ═══ File loading ═══════════════════════════════════════════════ */
+    /** Check which video output formats MediaRecorder supports and annotate the selector. */
+    _updateVideoFormatNote() {
+        const chosen = this.el.videoFormatSelect.value;
+        const mp4Supported = MediaRecorder.isTypeSupported('video/mp4') ||
+            MediaRecorder.isTypeSupported('video/mp4;codecs=avc1');
+        const webmSupported = MediaRecorder.isTypeSupported('video/webm');
 
-    /**
-     * Load a FileList, build ImageEntry objects, add to queue.
-     * @param {FileList} files
-     */
+        // Update MP4 option label
+        const mp4Opt = this.el.videoFormatSelect.querySelector('option[value="mp4"]');
+        mp4Opt.textContent = mp4Supported ? 'MP4 — supported' : 'MP4 — not supported in this browser';
+        mp4Opt.disabled = !mp4Supported;
+
+        // If user chose MP4 but it's not supported, fall back
+        if (chosen === 'mp4' && !mp4Supported) {
+            this.el.videoFormatSelect.value = 'webm';
+        }
+
+        this.el.videoFormatNote.textContent = !mp4Supported
+            ? 'MP4 recording is only supported in Safari. Chrome/Firefox output WebM.'
+            : '';
+    }
+
+    /* ═══ File loading ════════════════════════════════════════════════ */
+
     _addFiles(files) {
         [...files].forEach(file => {
-            if (!file.type.startsWith('image/')) return;
             const url = URL.createObjectURL(file);
-            const img = new Image();
-            img.onload = () => {
-                const entry = new ImageEntry(file, url, img.naturalWidth, img.naturalHeight);
-                this.entries.push(entry);
-                this._renderQueue();
-                this.el.clearAllBtn.disabled = false;
-                // Auto-select the first image added
-                if (this.entries.length === 1) this._selectEntry(0);
-                // Enable Crop All once there are at least 2 images
-                this.el.cropAllBtn.disabled = this.entries.length < 2;
-            };
-            img.src = url;
+
+            if (file.type.startsWith('image/')) {
+                const img = new Image();
+                img.onload = () => this._pushEntry(
+                    new ImageEntry(file, url, img.naturalWidth, img.naturalHeight)
+                );
+                img.onerror = () => URL.revokeObjectURL(url);
+                img.src = url;
+
+            } else if (file.type.startsWith('video/')) {
+                const probe = document.createElement('video');
+                probe.preload = 'metadata';
+                probe.onloadedmetadata = () => {
+                    this._pushEntry(new VideoEntry(
+                        file, url,
+                        probe.videoWidth, probe.videoHeight, probe.duration
+                    ));
+                    probe.src = '';
+                };
+                probe.onerror = () => URL.revokeObjectURL(url);
+                probe.src = url;
+            }
         });
     }
 
-    /* ═══ Queue rendering ════════════════════════════════════════════ */
+    _pushEntry(entry) {
+        this.entries.push(entry);
+        this._renderQueue();
+        if (this.entries.length === 1) this._selectEntry(0);
+        this._updateQueueControls();
+    }
 
-    /** Re-render the queue list from this.entries. */
+    _updateQueueControls() {
+        this.el.cropAllBtn.disabled = this.entries.length < 2;
+        this.el.clearAllBtn.disabled = this.entries.length === 0;
+    }
+
+    /* ═══ Queue rendering ═════════════════════════════════════════════ */
+
     _renderQueue() {
         this.el.imageQueue.innerHTML = '';
         this.entries.forEach((entry, idx) => {
@@ -272,13 +385,21 @@ class ImageCropper {
 
             const thumb = document.createElement('img');
             thumb.className = 'queue-thumb';
-            thumb.src = entry.objectUrl;
             thumb.alt = entry.file.name;
+            if (entry.isVideo) {
+                thumb.src = entry.thumbUrl ||
+                    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='40' viewBox='0 0 24 24' fill='none' stroke='%239e8fbb' stroke-width='1.5'%3E%3Crect x='2' y='2' width='20' height='20' rx='2'/%3E%3Cpath d='M7 2v20M17 2v20M2 12h20M2 7h5M17 7h5M17 17h5M2 17h5'/%3E%3C/svg%3E";
+            } else {
+                thumb.src = entry.objectUrl;
+            }
 
             const info = document.createElement('div');
             info.className = 'queue-info';
+            const typeTag = entry.isVideo
+                ? `<span style="color:var(--orange);font-size:0.58rem;font-weight:700;letter-spacing:0.06em">VIDEO</span> `
+                : '';
             info.innerHTML =
-                `<div class="queue-name">${entry.file.name}</div>` +
+                `<div class="queue-name">${typeTag}${entry.file.name}</div>` +
                 `<div class="queue-dims">${entry.naturalW} × ${entry.naturalH}px</div>`;
 
             const status = document.createElement('span');
@@ -291,7 +412,7 @@ class ImageCropper {
             const rmBtn = document.createElement('button');
             rmBtn.className = 'queue-remove';
             rmBtn.title = 'Remove';
-            rmBtn.setAttribute('aria-label', 'Remove image');
+            rmBtn.setAttribute('aria-label', 'Remove file');
             rmBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none"
                 stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
                 stroke-linejoin="round" aria-hidden="true">
@@ -308,76 +429,54 @@ class ImageCropper {
         });
     }
 
-    /**
-     * Remove entry at idx, clean up its object URLs, update active selection.
-     * @param {number} idx
-     */
     _removeEntry(idx) {
         const entry = this.entries[idx];
         URL.revokeObjectURL(entry.objectUrl);
-        // previewUrl is used by the output card img — only revoke if card was removed too
+        if (entry.previewUrl) URL.revokeObjectURL(entry.previewUrl);
+        if (entry.thumbUrl && entry.thumbUrl !== entry.previewUrl)
+            URL.revokeObjectURL(entry.thumbUrl);
         this.entries.splice(idx, 1);
 
         if (this.activeIndex === idx) {
             this.activeIndex = -1;
-            this._clearCanvas();
+            this._clearPreview();
         } else if (this.activeIndex > idx) {
             this.activeIndex--;
         }
 
-        this.el.cropAllBtn.disabled = this.entries.length < 2;
+        this._updateQueueControls();
         this._renderQueue();
         if (this.entries.length > 0 && this.activeIndex < 0) this._selectEntry(0);
     }
 
-    /** Revoke all object URLs and reset the workspace to its initial state. */
-    _clearAll() {
-        // Revoke every URL we own to avoid memory leaks
-        this.entries.forEach(e => {
-            URL.revokeObjectURL(e.objectUrl);
-            if (e.previewUrl) URL.revokeObjectURL(e.previewUrl);
-        });
-        this.entries = [];
-        this.activeIndex = -1;
+    /* ═══ Entry selection ═════════════════════════════════════════════ */
 
-        this._clearCanvas();
-        this.el.imageQueue.innerHTML = '';
-
-        // Reset output grid back to just the empty-state placeholder
-        this.el.outputGrid.innerHTML = '';
-        const placeholder = document.createElement('div');
-        placeholder.className = 'empty-state';
-        placeholder.id = 'emptyOutput';
-        placeholder.style.gridColumn = '1 / -1';
-        placeholder.innerHTML = `
-        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-            stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-            <polyline points="7 10 12 15 17 10"></polyline>
-            <line x1="12" y1="15" x2="12" y2="3"></line>
-        </svg>
-        <p>Cropped images will appear here</p>`;
-        this.el.outputGrid.appendChild(placeholder);
-        // Re-point the cached reference
-        this.el.emptyOutput = placeholder;
-
-        this.el.clearAllBtn.disabled = true;
-        this.el.downloadAllBtn.disabled = true;
-        this.el.cropAllBtn.disabled = true;
-        this.el.fileInput.value = '';
-    }
-
-    /* ═══ Entry selection / canvas ═══════════════════════════════════ */
-
-    /**
-     * Activate entry at idx — draw source image to canvas, restore crop region.
-     * @param {number} idx
-     */
     _selectEntry(idx) {
         if (idx < 0 || idx >= this.entries.length) return;
         this.activeIndex = idx;
         const entry = this.entries[idx];
 
+        this.el.sourceCanvas.hidden = true;
+        this.el.sourceVideo.hidden = true;
+        this.el.emptyPreview.style.display = 'none';
+
+        // Show/hide image-only controls
+        // Show/hide format controls based on file type
+        this.el.imageFormatGroup.style.display = entry.isVideo ? 'none' : '';
+        this.el.videoFormatGroup.hidden = !entry.isVideo;
+        this.el.qualityGroup.style.display =
+            entry.isVideo || this.el.formatSelect.value === 'image/png' ? 'none' : '';
+
+        if (entry.isVideo) {
+            this._setupVideoPreview(entry);
+        } else {
+            this._setupImagePreview(entry);
+        }
+
+        this._renderQueue();
+    }
+
+    _setupImagePreview(entry) {
         const canvas = this.el.sourceCanvas;
         const ctx = canvas.getContext('2d');
         const img = new Image();
@@ -387,59 +486,121 @@ class ImageCropper {
             canvas.height = img.naturalHeight;
             ctx.drawImage(img, 0, 0);
 
-            // Fit the canvas display into the wrapper respecting both axes.
-            // For wide images: constrain by width. For tall images: constrain
-            // by height (62vh) so the overlay never goes off-screen.
             const wrapW = this.el.canvasWrapper.clientWidth;
             const maxH = Math.floor(window.innerHeight * 0.62);
-            const byWidth = { w: wrapW, h: Math.round(img.naturalHeight * (wrapW / img.naturalWidth)) };
-            const byHeight = { h: maxH, w: Math.round(img.naturalWidth * (maxH / img.naturalHeight)) };
-
-            // Use whichever constraint produces the smaller result
-            const fitted = byWidth.h <= maxH ? byWidth : byHeight;
+            const fitted = fitSize(img.naturalWidth, img.naturalHeight, wrapW, maxH);
             canvas.style.width = `${fitted.w}px`;
             canvas.style.height = `${fitted.h}px`;
-
             canvas.hidden = false;
-            this.el.emptyPreview.style.display = 'none';
 
-            // Attach overlay to the wrapper but size+position it to sit exactly
-            // over the canvas, not the full wrapper width.
-            if (!this._overlayEl.parentElement) {
-                this.el.canvasWrapper.appendChild(this._overlayEl);
-            }
-            this._positionOverlayToCanvas();
+            this._attachOverlay();
+            this._setupResizeObserver(entry, canvas);
 
-            this._renderCropRegion();
-            this._syncInputsFromRegion();
-            this._updateReadout();
-
-            this.el.cropReadout.hidden = false;
-            this.el.resetCropBtn.disabled = false;
-            this.el.cropBtn.disabled = false;
-            this.el.cropAllBtn.disabled = this.entries.length < 2;
-
-            // Re-align overlay whenever the wrapper is resized (e.g. window resize,
-            // panel layout reflow on mobile)
-            if (this._resizeObs) this._resizeObs.disconnect();
-            this._resizeObs = new ResizeObserver(() => {
-                if (this.activeIndex >= 0) {
-                    this._positionOverlayToCanvas();
-                    this._renderCropRegion();
-                }
+            requestAnimationFrame(() => {
+                this._positionOverlay();
+                this._renderCropRegion();
+                this._syncInputsFromRegion();
+                this._updateReadout();
+                this._enableCropControls();
             });
-            this._resizeObs.observe(this.el.canvasWrapper);
         };
         img.src = entry.objectUrl;
-
-        this._renderQueue();
     }
 
-    /** Clear the canvas area when no image is active. */
-    _clearCanvas() {
+    _setupVideoPreview(entry) {
+        const vid = this.el.sourceVideo;
+
+        // Reset to avoid stale src
+        vid.pause();
+        vid.removeAttribute('src');
+        vid.load();
+
+        vid.onloadedmetadata = () => {
+            const wrapW = this.el.canvasWrapper.clientWidth;
+            const maxH = Math.floor(window.innerHeight * 0.62);
+            const fitted = fitSize(entry.naturalW, entry.naturalH, wrapW, maxH);
+            vid.style.width = `${fitted.w}px`;
+            vid.style.height = `${fitted.h}px`;
+            vid.hidden = false;
+            vid.play().catch(() => { });
+
+            this._attachOverlay();
+            this._setupResizeObserver(entry, vid);
+
+            requestAnimationFrame(() => {
+                this._positionOverlay();
+                this._renderCropRegion();
+                this._syncInputsFromRegion();
+                this._updateReadout();
+                this._enableCropControls();
+            });
+        };
+
+        vid.src = entry.objectUrl;
+        vid.load();
+    }
+
+    _attachOverlay() {
+        if (!this._overlayEl.parentElement) {
+            this.el.canvasWrapper.appendChild(this._overlayEl);
+        }
+    }
+
+    _setupResizeObserver(entry, previewEl) {
+        if (this._resizeObs) this._resizeObs.disconnect();
+        this._resizeObs = new ResizeObserver(() => {
+            if (this.activeIndex < 0) return;
+            const wrapW = this.el.canvasWrapper.clientWidth;
+            const maxH = Math.floor(window.innerHeight * 0.62);
+            const fitted = fitSize(entry.naturalW, entry.naturalH, wrapW, maxH);
+            previewEl.style.width = `${fitted.w}px`;
+            previewEl.style.height = `${fitted.h}px`;
+            requestAnimationFrame(() => {
+                this._positionOverlay();
+                this._renderCropRegion();
+            });
+        });
+        this._resizeObs.observe(this.el.canvasWrapper);
+    }
+
+    /**
+     * Position the overlay div to sit exactly over the active preview element,
+     * using getBoundingClientRect so centering/letterboxing is accounted for.
+     */
+    _positionOverlay() {
+        if (this.activeIndex < 0) return;
+        const isVideo = this.entries[this.activeIndex].isVideo;
+        const previewEl = isVideo ? this.el.sourceVideo : this.el.sourceCanvas;
+        const wrapRect = this.el.canvasWrapper.getBoundingClientRect();
+        const prevRect = previewEl.getBoundingClientRect();
+
+        Object.assign(this._overlayEl.style, {
+            position: 'absolute',
+            inset: 'unset',
+            left: `${prevRect.left - wrapRect.left}px`,
+            top: `${prevRect.top - wrapRect.top}px`,
+            width: `${prevRect.width}px`,
+            height: `${prevRect.height}px`,
+        });
+    }
+
+    _enableCropControls() {
+        this.el.cropReadout.hidden = false;
+        this.el.resetCropBtn.disabled = false;
+        this.el.cropBtn.disabled = false;
+        this.el.cropAllBtn.disabled = this.entries.length < 2;
+    }
+
+    _clearPreview() {
         this.el.sourceCanvas.hidden = true;
+        this.el.sourceVideo.hidden = true;
+        this.el.sourceVideo.pause();
+        this.el.sourceVideo.src = '';
         this.el.emptyPreview.style.display = '';
-        if (this._overlayEl.parentElement) this._overlayEl.parentElement.removeChild(this._overlayEl);
+        if (this._overlayEl.parentElement) {
+            this._overlayEl.parentElement.removeChild(this._overlayEl);
+        }
+        if (this._resizeObs) { this._resizeObs.disconnect(); this._resizeObs = null; }
         this.el.cropReadout.hidden = true;
         this.el.resetCropBtn.disabled = true;
         this.el.cropBtn.disabled = true;
@@ -448,39 +609,9 @@ class ImageCropper {
 
     /* ═══ Crop region rendering ═══════════════════════════════════════ */
 
-    /**
- * Size and position the crop overlay div so it sits exactly over the
- * rendered canvas element, regardless of how the canvas is aligned
- * inside the wrapper.
- * Called after every canvas resize and on window resize.
- */
-    _positionOverlayToCanvas() {
-        const canvas = this.el.sourceCanvas;
-        const wrapperRect = this.el.canvasWrapper.getBoundingClientRect();
-        const canvasRect = canvas.getBoundingClientRect();
-
-        // Offset of canvas inside the wrapper
-        const offsetLeft = canvasRect.left - wrapperRect.left;
-        const offsetTop = canvasRect.top - wrapperRect.top;
-
-        Object.assign(this._overlayEl.style, {
-            position: 'absolute',
-            left: `${offsetLeft}px`,
-            top: `${offsetTop}px`,
-            width: `${canvasRect.width}px`,
-            height: `${canvasRect.height}px`,
-            // Override inset:0 from shared.css
-            inset: 'unset',
-        });
-    }
-
-    /** Position the overlay div from the active entry's normalised region. */
     _renderCropRegion() {
-        if (this.activeIndex < 0) return;
+        if (this.activeIndex < 0 || !this._overlayEl.parentElement) return;
         const entry = this.entries[this.activeIndex];
-        const canvas = this.el.sourceCanvas;
-
-        // Overlay now matches canvas exactly — use its own dimensions
         const dW = this._overlayEl.offsetWidth;
         const dH = this._overlayEl.offsetHeight;
 
@@ -492,7 +623,6 @@ class ImageCropper {
         });
     }
 
-    /** Populate the four pixel inputs from the active entry's region. */
     _syncInputsFromRegion() {
         if (this.activeIndex < 0) return;
         const entry = this.entries[this.activeIndex];
@@ -509,43 +639,32 @@ class ImageCropper {
         this.el.inH.value = px.h;
     }
 
-    /** Refresh the crop dimensions readout strip. */
     _updateReadout() {
         if (this.activeIndex < 0) return;
         const px = this.entries[this.activeIndex].pixelRegion;
         this.el.cropReadout.innerHTML =
-            `Crop: <span style="color:var(--accent)">${px.w}&thinsp;×&thinsp;${px.h}px</span>` +
+            `Crop: <span style="color:var(--accent)">${px.w}&thinsp;&times;&thinsp;${px.h}px</span>` +
             `&ensp;at&ensp;<span style="color:var(--text2)">(${px.x}, ${px.y})</span>`;
     }
 
-    /* ═══ Aspect ratio constraint ════════════════════════════════════ */
+    /* ═══ Aspect ratio constraint ═════════════════════════════════════ */
 
-    /**
-     * Constrain the active entry's region to this.aspectRatio if set,
-     * keeping the top-left anchor and shrinking the over-sized axis.
-     */
     _applyAspectConstraint() {
         if (!this.aspectRatio || this.activeIndex < 0) return;
         const r = this.entries[this.activeIndex].region;
-
         let w = r.w, h = r.h;
         if (w / h > this.aspectRatio) w = h * this.aspectRatio;
         else h = w / this.aspectRatio;
-
-        // Clamp within image bounds
         w = Math.min(w, 1 - r.x);
         h = Math.min(h, 1 - r.y);
-        // Re-balance after clamp
         if (w / h > this.aspectRatio) w = h * this.aspectRatio;
         else h = w / this.aspectRatio;
-
         r.w = Math.max(0.01, w);
         r.h = Math.max(0.01, h);
     }
 
-    /* ═══ Manual pixel inputs ════════════════════════════════════════ */
+    /* ═══ Manual pixel inputs ═════════════════════════════════════════ */
 
-    /** Read pixel inputs, clamp, normalise, commit to active entry. */
     _applyManualInputs() {
         if (this.activeIndex < 0) return;
         const entry = this.entries[this.activeIndex];
@@ -556,7 +675,6 @@ class ImageCropper {
         let w = clamp(parseInt(this.el.inW.value) || vw, 1, vw - x);
         let h = clamp(parseInt(this.el.inH.value) || vh, 1, vh - y);
 
-        // Enforce aspect ratio by locking h to w
         if (this.aspectRatio) {
             h = Math.round(w / this.aspectRatio);
             h = clamp(h, 1, vh - y);
@@ -565,13 +683,11 @@ class ImageCropper {
         }
 
         entry.region = { x: x / vw, y: y / vh, w: w / vw, h: h / vh };
-
         this._renderCropRegion();
         this._syncInputsFromRegion();
         this._updateReadout();
     }
 
-    /** Reset the active entry's crop to the full image frame. */
     _resetCrop() {
         if (this.activeIndex < 0) return;
         this.entries[this.activeIndex].region = { x: 0, y: 0, w: 1, h: 1 };
@@ -580,14 +696,8 @@ class ImageCropper {
         this._updateReadout();
     }
 
-    /* ═══ Drag logic ═════════════════════════════════════════════════ */
+    /* ═══ Drag logic ══════════════════════════════════════════════════ */
 
-    /**
-     * Begin a drag operation.
-     * @param {number} clientX
-     * @param {number} clientY
-     * @param {string} handle - 'move' | 'nw' | 'n' | 'ne' | 'w' | 'e' | 'sw' | 's' | 'se'
-     */
     _dragStart(clientX, clientY, handle) {
         if (this.activeIndex < 0) return;
         this._dragging = true;
@@ -599,18 +709,11 @@ class ImageCropper {
         document.body.classList.add('dragging-active');
     }
 
-    /**
-     * Update the crop region while dragging.
-     * @param {number} clientX
-     * @param {number} clientY
-     */
     _dragMove(clientX, clientY) {
         if (!this._dragging || this.activeIndex < 0) return;
 
-        // Deltas must be relative to the overlay (which sits over the canvas),
-        // not the wrapper or the raw canvas element
+        // Deltas are relative to the overlay, which matches the preview element exactly
         const rect = this._overlayEl.getBoundingClientRect();
-
         const dx = (clientX - this._startX) / rect.width;
         const dy = (clientY - this._startY) / rect.height;
         const MIN = 0.02;
@@ -634,7 +737,6 @@ class ImageCropper {
                 const nw = sr.w + dx;
                 if (nw >= MIN) r.w = Math.min(1 - r.x, nw);
             }
-
             if (isT) {
                 const ny = clamp(sr.y + dy, 0, 1);
                 const nh = sr.h - dy;
@@ -645,15 +747,12 @@ class ImageCropper {
             }
         }
 
-        // Safety clamps
         if (r.x + r.w > 1) r.w = 1 - r.x;
         if (r.y + r.h > 1) r.h = 1 - r.y;
 
-        // Apply aspect ratio constraint during resize drags
         if (this.aspectRatio && this._handle !== 'move') {
             if (r.w / r.h > this.aspectRatio) r.h = r.w / this.aspectRatio;
             else r.w = r.h * this.aspectRatio;
-            // Safety re-clamp after ratio correction
             if (r.x + r.w > 1) { r.w = 1 - r.x; r.h = r.w / this.aspectRatio; }
             if (r.y + r.h > 1) { r.h = 1 - r.y; r.w = r.h * this.aspectRatio; }
         }
@@ -664,7 +763,6 @@ class ImageCropper {
         this._updateReadout();
     }
 
-    /** End the current drag. */
     _dragEnd() {
         if (!this._dragging) return;
         this._dragging = false;
@@ -673,17 +771,9 @@ class ImageCropper {
         document.body.classList.remove('dragging-active');
     }
 
-    /* ═══ Cropping ═══════════════════════════════════════════════════ */
+    /* ═══ Cropping ════════════════════════════════════════════════════ */
 
-    /**
-     * Crop a single ImageEntry using its current region.
-     * Creates the output Blob, stores the preview URL on the entry,
-     * and adds a card to the output grid.
-     * @param {ImageEntry} entry
-     * @param {string}     mime    - output MIME type
-     * @param {number}     quality - 0-1 quality for lossy formats
-     */
-    async _cropEntry(entry, mime, quality) {
+    async _cropImageEntry(entry, mime, quality) {
         const px = entry.pixelRegion;
         const out = document.createElement('canvas');
         out.width = px.w;
@@ -691,18 +781,117 @@ class ImageCropper {
         const ctx = out.getContext('2d');
 
         const img = new Image();
-        await new Promise(res => { img.onload = res; img.src = entry.objectUrl; });
+        await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = entry.objectUrl; });
         ctx.drawImage(img, px.x, px.y, px.w, px.h, 0, 0, px.w, px.h);
 
         const blob = await new Promise(res => out.toBlob(res, mime, quality));
         entry.cropped = blob;
 
-        // Store the preview URL on the entry so the overlay can reuse it
-        // without revoking it when the overlay closes.
+        if (entry.previewUrl) URL.revokeObjectURL(entry.previewUrl);
+        entry.previewUrl = URL.createObjectURL(blob);
+        entry.thumbUrl = entry.previewUrl;
+
+        this._addOutputCard(entry, mimeToExt(mime));
+        this._afterCrop();
+    }
+
+    async _cropVideoEntry(entry) {
+        const px = entry.pixelRegion;
+        const wantExt = this.el.videoFormatSelect.value; // 'webm' or 'mp4'
+
+        // Resolve actual MIME based on what MediaRecorder supports
+        const mp4Candidates = ['video/mp4;codecs=avc1', 'video/mp4'];
+        const webmCandidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+        const candidates = wantExt === 'mp4'
+            ? [...mp4Candidates, ...webmCandidates]
+            : [...webmCandidates, ...mp4Candidates];
+        const mime = candidates.find(m => MediaRecorder.isTypeSupported(m)) ?? 'video/webm';
+        const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+
+        // Show progress overlay
+        this.el.cropProgressOverlay.hidden = false;
+        this.el.cropProgressStatus.textContent = 'Recording…';
+        this.el.cropProgressDetail.textContent =
+            `${px.w}×${px.h}px · ${ext.toUpperCase()} · ${entry.duration.toFixed(1)}s`;
+
+        const out = document.createElement('canvas');
+        out.width = px.w;
+        out.height = px.h;
+        const ctx = out.getContext('2d');
+
+        const vid = this.el.sourceVideo;
+        vid.pause();
+        vid.loop = false;
+        vid.currentTime = 0;
+        await new Promise(res => { vid.onseeked = res; });
+        vid.onseeked = null;
+
+        const stream = out.captureStream(30);
+        const recorder = new MediaRecorder(stream, { mimeType: mime });
+        const chunks = [];
+        recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+        const startTime = performance.now();
+        recorder.start(100);
+
+        let rafId;
+        const draw = () => {
+            ctx.drawImage(vid, px.x, px.y, px.w, px.h, 0, 0, px.w, px.h);
+            // Update elapsed time in the overlay
+            const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+            this.el.cropProgressDetail.textContent =
+                `${px.w}×${px.h}px · ${ext.toUpperCase()} · ${elapsed}s / ${entry.duration.toFixed(1)}s`;
+            if (!vid.ended && !vid.paused) rafId = requestAnimationFrame(draw);
+        };
+
+        await new Promise((resolve, reject) => {
+            vid.onended = () => {
+                cancelAnimationFrame(rafId);
+                ctx.drawImage(vid, px.x, px.y, px.w, px.h, 0, 0, px.w, px.h);
+                recorder.stop();
+            };
+            recorder.onstop = resolve;
+            recorder.onerror = e => reject(e.error ?? e);
+            vid.play()
+                .then(() => { rafId = requestAnimationFrame(draw); })
+                .catch(reject);
+        });
+
+        // Restore preview video
+        vid.onended = null;
+        vid.loop = true;
+        vid.currentTime = 0;
+        vid.play().catch(() => { });
+
+        // Hide progress overlay, show elapsed
+        const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+        this.el.cropProgressOverlay.hidden = true;
+
+        const blob = new Blob(chunks, { type: mime });
+        entry.cropped = blob;
+        entry.croppedExt = ext; // store resolved ext for download naming
+        entry.elapsed = elapsed;
+
         if (entry.previewUrl) URL.revokeObjectURL(entry.previewUrl);
         entry.previewUrl = URL.createObjectURL(blob);
 
-        this._addOutputCard(entry, mime);
+        // Poster thumbnail
+        const thumb = document.createElement('canvas');
+        const tW = Math.min(200, px.w);
+        const tH = Math.round(px.h * (tW / px.w));
+        thumb.width = tW;
+        thumb.height = tH;
+        thumb.getContext('2d').drawImage(out, 0, 0, px.w, px.h, 0, 0, tW, tH);
+        if (entry.thumbUrl) URL.revokeObjectURL(entry.thumbUrl);
+        entry.thumbUrl = await new Promise(res =>
+            thumb.toBlob(b => res(URL.createObjectURL(b)), 'image/jpeg', 0.8)
+        );
+
+        this._addOutputCard(entry, ext);
+        this._afterCrop();
+    }
+
+    _afterCrop() {
         this.el.emptyOutput.style.display = 'none';
         this.el.downloadAllBtn.disabled = false;
     }
@@ -710,77 +899,116 @@ class ImageCropper {
     /** Crop the currently active image. */
     async _cropActive() {
         if (this.activeIndex < 0) return;
-        const mime = this.el.formatSelect.value;
-        const quality = parseInt(this.el.qualityInput.value) / 100;
+        const entry = this.entries[this.activeIndex];
 
-        await this._cropEntry(this.entries[this.activeIndex], mime, quality);
-        this._renderQueue();
+        this.el.cropBtn.disabled = true;
+        this.el.cropAllBtn.disabled = true;
+        if (entry.isVideo) this.el.processingBadge.hidden = false;
 
-        // Auto-advance to the next un-cropped entry
+        try {
+            if (entry.isVideo) {
+                await this._cropVideoEntry(entry);
+            } else {
+                await this._cropImageEntry(
+                    entry,
+                    this.el.formatSelect.value,
+                    parseInt(this.el.qualityInput.value) / 100
+                );
+            }
+        } finally {
+            this.el.processingBadge.hidden = true;
+            this.el.cropBtn.disabled = false;
+            this.el.cropAllBtn.disabled = this.entries.length < 2;
+            this._renderQueue();
+        }
+
         const next = this.entries.findIndex((e, i) => i > this.activeIndex && !e.cropped);
         if (next >= 0) this._selectEntry(next);
     }
 
-    /**
-     * Apply the current active region to every entry and crop them all.
-     * Uses the normalised region, so the same proportional area is taken
-     * from images of any dimension.
-     */
     async _cropAll() {
         if (this.activeIndex < 0 || this.entries.length < 2) return;
-
-        // Snapshot the template region before iteration mutates entries
         const templateRegion = { ...this.entries[this.activeIndex].region };
         const mime = this.el.formatSelect.value;
         const quality = parseInt(this.el.qualityInput.value) / 100;
 
-        // Disable buttons while running to prevent double-triggers
         this.el.cropBtn.disabled = true;
         this.el.cropAllBtn.disabled = true;
+        this.el.processingBadge.hidden = false;
 
-        for (const entry of this.entries) {
-            entry.region = { ...templateRegion };
-            await this._cropEntry(entry, mime, quality);
+        try {
+            for (const entry of this.entries) {
+                entry.region = { ...templateRegion };
+                if (entry.isVideo) {
+                    await this._cropVideoEntry(entry);
+                } else {
+                    await this._cropImageEntry(entry, mime, quality);
+                }
+            }
+        } finally {
+            this.el.processingBadge.hidden = true;
+            this.el.cropBtn.disabled = false;
+            this.el.cropAllBtn.disabled = this.entries.length < 2;
+            this._renderQueue();
         }
-
-        this._renderQueue();
-        this.el.cropBtn.disabled = false;
-        this.el.cropAllBtn.disabled = this.entries.length < 2;
     }
 
-    /**
-     * Add (or replace) an output card for the given entry.
-     * @param {ImageEntry} entry
-     * @param {string}     mime
-     */
-    _addOutputCard(entry, mime) {
-        // Remove previous card for this entry if re-cropping
+    /* ═══ Output cards ════════════════════════════════════════════════ */
+
+    _addOutputCard(entry, ext) {
         const existing = document.getElementById(`out-${entry.id}`);
         if (existing) existing.remove();
 
-        const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[mime] || 'png';
-        const name = entry.file.name.replace(/\.[^.]+$/, '') + `_crop.${ext}`;
+        // ext param is correct for images; for video use the stored resolved ext
+        const resolvedExt = entry.isVideo ? (entry.croppedExt ?? ext) : ext;
+        const name = entry.file.name.replace(/\.[^.]+$/, '') + `_crop.${resolvedExt}`;
+
         const px = entry.pixelRegion;
+        const sizeKb = entry.cropped.size / 1024;
+        const sizeStr = sizeKb >= 1024 ? `${(sizeKb / 1024).toFixed(2)} MB` : `${sizeKb.toFixed(1)} KB`;
+        const timeStr = entry.elapsed ? ` · ⏱ ${entry.elapsed}s` : '';
+
+        const info = document.createElement('div');
+        info.className = 'output-card-info';
+        info.innerHTML =
+            `<div class="output-card-name">${name}</div>` +
+            `<div>${px.w} × ${px.h}px · ${sizeStr}${timeStr}</div>`;
 
         const card = document.createElement('div');
         card.className = 'output-card';
         card.id = `out-${entry.id}`;
 
         const img = document.createElement('img');
-        img.src = entry.previewUrl;
+        img.src = entry.thumbUrl || entry.previewUrl;
         img.alt = name;
-        // Open overlay using the stored previewUrl — never re-creates or revokes it here
+        // img.addEventListener('click', () => {
+        //     if (entry.isVideo) {
+        //         // Can't show video in the img overlay — download instead
+        //         this._downloadBlob(entry.cropped, name);
+        //     } else {
+        //         this.el.overlayImg.src = entry.previewUrl;
+        //         this.el.previewOverlay.hidden = false;
+        //         document.body.style.overflow = 'hidden';
+        //     }
+        // });
+        // if (!entry.isVideo) img.style.cursor = 'zoom-in';
+
         img.addEventListener('click', () => {
-            this.el.overlayImg.src = entry.previewUrl;
+            if (entry.isVideo) {
+                // Show video in overlay
+                this.el.overlayImg.style.display = 'none';
+                this.el.overlayVid.style.display = 'block';
+                this.el.overlayVid.src = entry.previewUrl;
+                this.el.overlayVid.play().catch(() => { });
+            } else {
+                this.el.overlayVid.style.display = 'none';
+                this.el.overlayImg.style.display = 'block';
+                this.el.overlayImg.src = entry.previewUrl;
+            }
             this.el.previewOverlay.hidden = false;
             document.body.style.overflow = 'hidden';
         });
-
-        const info = document.createElement('div');
-        info.className = 'output-card-info';
-        info.innerHTML =
-            `<div class="output-card-name">${name}</div>` +
-            `<div>${px.w} × ${px.h}px · ${(entry.cropped.size / 1024).toFixed(1)} KB</div>`;
+        img.style.cursor = 'zoom-in'; // same for both — thumbnail is always an image
 
         const dlBtn = document.createElement('button');
         dlBtn.className = 'output-card-btn';
@@ -795,37 +1023,98 @@ class ImageCropper {
         card.appendChild(img);
         card.appendChild(info);
         card.appendChild(dlBtn);
-
-        // Insert before the empty-state placeholder so it stays at the bottom
         this.el.outputGrid.insertBefore(card, this.el.emptyOutput);
     }
 
-    /* ═══ Download helpers ═══════════════════════════════════════════ */
+    /* ═══ Clear All ═══════════════════════════════════════════════════ */
 
-    /**
-     * Trigger a browser download for a Blob.
-     * @param {Blob}   blob
-     * @param {string} filename
-     */
+    _clearAll() {
+        this.entries.forEach(e => {
+            URL.revokeObjectURL(e.objectUrl);
+            if (e.previewUrl) URL.revokeObjectURL(e.previewUrl);
+            if (e.thumbUrl && e.thumbUrl !== e.previewUrl) URL.revokeObjectURL(e.thumbUrl);
+        });
+        this.entries = [];
+        this.activeIndex = -1;
+
+        this._clearPreview();
+        this.el.imageQueue.innerHTML = '';
+        this.el.fileInput.value = '';
+
+        this.el.outputGrid.innerHTML = '';
+        const placeholder = document.createElement('div');
+        placeholder.className = 'empty-state';
+        placeholder.id = 'emptyOutput';
+        placeholder.style.gridColumn = '1 / -1';
+        placeholder.innerHTML =
+            `<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line></svg>
+            <p>Cropped files will appear here</p>`;
+        this.el.outputGrid.appendChild(placeholder);
+        this.el.emptyOutput = placeholder;
+
+        this.el.clearAllBtn.disabled = true;
+        this.el.downloadAllBtn.disabled = true;
+        this.el.cropAllBtn.disabled = true;
+    }
+
+    /* ═══ Download helpers ════════════════════════════════════════════ */
+
     _downloadBlob(blob, filename) {
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = filename;
         a.click();
-        // Revoke after a tick — the download is initiated synchronously
         setTimeout(() => URL.revokeObjectURL(a.href), 100);
     }
 
-    /** Download all cropped images sequentially. */
-    _downloadAll() {
-        const mime = this.el.formatSelect.value;
-        const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[mime] || 'png';
-        this.entries
-            .filter(e => e.cropped)
-            .forEach(e => {
+    async _downloadAll() {
+        const cropped = this.entries.filter(e => e.cropped);
+        if (cropped.length === 0) return;
+
+        // If any video entries are present, skip zip — download individually
+        const hasVideo = cropped.some(e => e.isVideo);
+        if (hasVideo) {
+            const imgExt = mimeToExt(this.el.formatSelect.value);
+            cropped.forEach(e => {
+                const ext = e.isVideo ? (e.croppedExt ?? 'webm') : imgExt;
                 const name = e.file.name.replace(/\.[^.]+$/, '') + `_crop.${ext}`;
                 this._downloadBlob(e.cropped, name);
             });
+            return;
+        }
+
+        // Images only — zip them
+        if (cropped.length === 1) {
+            const e = cropped[0];
+            const ext = mimeToExt(this.el.formatSelect.value);
+            this._downloadBlob(e.cropped, e.file.name.replace(/\.[^.]+$/, '') + `_crop.${ext}`);
+            return;
+        }
+
+        if (typeof JSZip !== 'undefined') {
+            this.el.downloadAllBtn.disabled = true;
+            try {
+                const zip = new JSZip();
+                const imgExt = mimeToExt(this.el.formatSelect.value);
+                cropped.forEach(e => {
+                    const name = e.file.name.replace(/\.[^.]+$/, '') + `_crop.${imgExt}`;
+                    zip.file(name, e.cropped);
+                });
+                const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+                this._downloadBlob(blob, 'nyanpasu-crops.zip');
+            } finally {
+                this.el.downloadAllBtn.disabled = false;
+            }
+        } else {
+            const imgExt = mimeToExt(this.el.formatSelect.value);
+            cropped.forEach(e => {
+                this._downloadBlob(e.cropped, e.file.name.replace(/\.[^.]+$/, '') + `_crop.${imgExt}`);
+            });
+        }
     }
 }
 
@@ -834,5 +1123,5 @@ class ImageCropper {
    BOOTSTRAP
    ═══════════════════════════════════════════════════════════════════ */
 document.addEventListener('DOMContentLoaded', () => {
-    new ImageCropper();
+    new MediaCropper();
 });

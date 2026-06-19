@@ -173,6 +173,19 @@
   -webkit-user-select: none;
 }
 
+/* Video preview in canvas wrapper — same sizing behaviour as the canvas */
+#sourceVideo {
+  display: block;
+  max-width: 100%;
+  max-height: 62vh;
+  width: auto;
+  height: auto;
+  border-radius: var(--radius-sm);
+  user-select: none;
+  -webkit-user-select: none;
+  background: #000;
+}
+
 /* Rule-of-thirds grid lines overlaid on the crop region */
 .crop-region::before {
   content: "";
@@ -557,6 +570,17 @@ input[type="range"] {
 .empty-state p {
   font-family: var(--font-mono);
   font-size: 0.72rem;
+}
+
+/* ── Processing badge pulse ── */
+@keyframes pulse-badge {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════
